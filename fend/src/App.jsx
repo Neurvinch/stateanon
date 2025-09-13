@@ -1,5 +1,5 @@
 import { useState, useEffect, Component } from 'react';
-import { LogInWithAnonAadhaar, AnonAadhaarProof } from '@anon-aadhaar/react';
+import { LogInWithAnonAadhaar, AnonAadhaarProof, useAnonAadhaar, useProver } from '@anon-aadhaar/react';
 import { parseProofForVerifier } from '@anon-aadhaar/core';
 import MerkleTree from 'merkletreejs';
 import keccak256 from 'keccak256';
@@ -57,17 +57,9 @@ const COLLEGE_VOTING_ABI = [
   },
 ];
 
-function App() {
-  return (
-    <ErrorBoundary>
-      <AnonAadhaarComponent />
-    </ErrorBoundary>
-  );
-}
-
-function AnonAadhaarComponent() {
-  const [profile, setProfile] = useState(null);
-  const [latestProof, setLatestProof] = useState(null);
+function App({ useTestAadhaar, setUseTestAadhaar }) {
+  const [anonAadhaar] = useAnonAadhaar();
+  const [, latestProof] = useProver();
   const [voteOption, setVoteOption] = useState(1);
   const [comment, setComment] = useState('');
   const [account, setAccount] = useState(null);
@@ -79,14 +71,49 @@ function AnonAadhaarComponent() {
   const [commentTxHash, setCommentTxHash] = useState(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
-  const contractAddress = "0x95c1AE6Ad8F7821F257C5E618B913C9be3077a3B";
+  const contractAddress = "0x95c1ae6ad8f7821f257c5e618b913c9be3077a3b";
 
-  // Sample pincode data
+  // Sample pincode data (expanded with Tamil Nadu)
   const statePincodes = {
     Maharashtra: ['400001', '400002', '411001', '411002'],
     Karnataka: ['560001', '560002', '560003'],
-    TamilNadu: ['600001', '600002', '600003'],
-  };
+    'Tamil Nadu': ['600052'], // Added for Red Hills, Tamil Nadu
+    // Add more states/pincodes or fetch dynamically
+  }; 
+   const [profile, setProfile] = useState(null);
+
+  useEffect(() => {
+    if (anonAadhaar?.status !== "logged-in" || !latestProof) {
+      setProfile(null);
+      return;
+    }
+
+    const { claim = {}, proof = {} } = latestProof;
+
+    let nullifierHash = "";
+    try {
+      nullifierHash = proof.nullifier
+        ? keccak256(toUtf8Bytes(String(proof.nullifier)))
+        : "";
+    } catch (e) {
+      console.warn("Failed to compute nullifierHash:", e);
+    }
+
+    const userProfile = {
+      aadhaarVerified: true,
+     
+      state: claim.state || "",
+      pincode: claim.pincode || "",
+      ageAbove18: claim.ageAbove18 || false,
+      gender: claim.gender || "",
+      
+      nullifierHash,
+    };
+
+    setProfile(userProfile);
+    console.log("✅ Final Profile:", userProfile);
+  }, [anonAadhaar?.status, latestProof]);
+
 
   useEffect(() => {
     if (!contractAddress) {
@@ -153,6 +180,15 @@ function AnonAadhaarComponent() {
     }
   }, [contractAddress]);
 
+  useEffect(() => {
+    if (anonAadhaar.status === 'logged-in') {
+      console.log('User logged in:', anonAadhaar);
+      console.log('Proof fields:', anonAadhaar.anonAadhaarProofs['0']);
+       
+    }
+  }, [anonAadhaar]);
+
+
   const connectWallet = async () => {
     if (!contractAddress) {
       setError('Missing VITE_COLLEGE_VOTING_ADDRESS in .env file!');
@@ -190,48 +226,58 @@ function AnonAadhaarComponent() {
     }
   };
 
-  const handleProofSuccess = (proof, revealedFields) => {
-    setLatestProof(proof);
-    const newProfile = {
-      ...revealedFields,
-      aadhaarVerified: true,
-      nullifierHash: proof.nullifierHash,
-      name: '',
-      collegeYear: '',
-      class: '',
-    };
-    setProfile(newProfile);
-    console.log('Proof generated:', proof);
-  };
-
   const getMerkleProof = (state, pincode) => {
+    if (!state || !pincode) {
+      console.error('Invalid state or pincode:', { state, pincode });
+      return [];
+    }
     const pincodes = statePincodes[state] || [];
-    if (!pincodes.includes(pincode)) {
-      console.error('Pincode not in state list');
+    const pincodeStr = pincode.toString();
+    if (!pincodes.includes(pincodeStr)) {
+      console.error('Pincode not in state list:', { state, pincode: pincodeStr, available: pincodes });
       return [];
     }
     const leaves = pincodes.map((code) => keccak256(code));
     const tree = new MerkleTree(leaves, keccak256, { sortPairs: true });
-    const leaf = keccak256(pincode);
-    return tree.getProof(leaf);
+    const leaf = keccak256(pincodeStr);
+    const proof = tree.getProof(leaf);
+    console.log('Generated Merkle proof:', proof);
+    return proof;
   };
 
   const handleVote = async () => {
-    if (!contract || !latestProof || !profile) {
+    if (!contract || !latestProof || anonAadhaar.status !== 'logged-in') {
       alert('Please verify Aadhaar first and connect wallet');
+      return;
+    }
+    const { state, pincode } = profile || {};
+    if (!state || !pincode) {
+      alert('Invalid Aadhaar proof: missing state or pincode');
+      console.error('Invalid Aadhaar proof:', { state, pincode });
+      return;
+    }
+    const merkleProof = getMerkleProof(state, pincode);
+    if (merkleProof.length === 0) {
+      alert(`Invalid pincode ${pincode} for state ${state}. Supported pincodes: ${statePincodes[state]?.join(', ') || 'none'}.`);
       return;
     }
     setLoading(true);
     try {
-      const merkleProof = getMerkleProof(profile.state, profile.pincode);
       const [a, b, c, input] = parseProofForVerifier(latestProof);
       const tx = await contract.vote(voteOption, a, b, c, input, merkleProof.map(p => p.data));
       const receipt = await tx.wait();
       setVoteTxHash(receipt.hash);
       console.log('Vote submitted:', receipt.hash);
+      alert('Vote submitted successfully!');
     } catch (error) {
       console.error('Vote failed:', error);
-      alert('Vote failed: ' + error.message);
+      let errorMsg = 'Vote failed: Unknown error';
+      if (error.reason) {
+        errorMsg = `Vote failed: ${error.reason}`;
+      } else if (error.message) {
+        errorMsg = `Vote failed: ${error.message}`;
+      }
+      alert(errorMsg);
     }
     setLoading(false);
   };
@@ -248,9 +294,16 @@ function AnonAadhaarComponent() {
       setCommentTxHash(receipt.hash);
       setComment('');
       console.log('Comment added:', receipt.hash);
+      alert('Comment added successfully!');
     } catch (error) {
       console.error('Comment failed:', error);
-      alert('Comment failed: ' + error.message);
+      let errorMsg = 'Comment failed: Unknown error';
+      if (error.reason) {
+        errorMsg = `Comment failed: ${error.reason}`;
+      } else if (error.message) {
+        errorMsg = `Comment failed: ${error.message}`;
+      }
+      alert(errorMsg);
     }
     setLoading(false);
   };
@@ -303,127 +356,138 @@ function AnonAadhaarComponent() {
   }
 
   return (
-    <div className="min-h-screen bg-gradient-to-br from-indigo-50 to-indigo-100 flex items-center justify-center px-4">
-      <main className="w-full max-w-lg bg-white rounded-2xl shadow-lg p-8 flex flex-col items-center gap-6">
-        <h1 className="font-extrabold text-2xl text-gray-900 text-center">
-          🔐 Anon Aadhaar College Voting
-        </h1>
-        <p className="text-gray-600 text-center">
-          Prove identity anonymously & vote/comment on-chain.
-        </p>
-        {account && typeof account === 'string' && (
-          <p className="text-sm text-gray-500">
-            Connected: {account.slice(0, 6)}...{account.slice(-4)}
+    <ErrorBoundary>
+      <div className="min-h-screen bg-gradient-to-br from-indigo-50 to-indigo-100 flex items-center justify-center px-4">
+        <main className="w-full max-w-lg bg-white rounded-2xl shadow-lg p-8 flex flex-col items-center gap-6">
+          <h1 className="font-extrabold text-2xl text-gray-900 text-center">
+            🔐 Anon Aadhaar College Voting
+          </h1>
+          <p className="text-gray-600 text-center">
+            Prove your identity <span className="font-semibold">anonymously</span> using Aadhaar — secure, simple, private.
           </p>
-        )}
-
-        {!profile?.aadhaarVerified ? (
-          <LogInWithAnonAadhaar
-            fieldsToReveal={["revealGender", "revealAgeAbove18", "revealState", "revealPinCode"]}
-            nullifierSeed={1234}
-            onSuccess={handleProofSuccess}
-          />
-        ) : (
-          <div className="w-full bg-green-50 border border-green-200 rounded-xl p-4">
-            <p className="text-green-700 font-semibold text-center">✅ Aadhaar Verified</p>
-
-            <div className="mt-4 space-y-3">
-              <div>
-                <label className="block text-sm font-medium text-gray-700">Name</label>
-                <input
-                  type="text"
-                  value={profile.name}
-                  onChange={(e) => setProfile({ ...profile, name: e.target.value })}
-                  className="w-full border border-gray-300 rounded-md p-2"
-                />
-              </div>
-              <div>
-                <label className="block text-sm font-medium text-gray-700">Pincode</label>
-                <input type="text" disabled value={profile.pincode} className="w-full border border-gray-300 rounded-md p-2 bg-gray-100" />
-              </div>
-              <div>
-                <label className="block text-sm font-medium text-gray-700">State</label>
-                <input type="text" disabled value={profile.state} className="w-full border border-gray-300 rounded-md p-2 bg-gray-100" />
-              </div>
-              <div>
-                <label className="block text-sm font-medium text-gray-700">Age</label>
-                <input type="text" disabled value={profile.ageAbove18 ? "18+" : "Under 18"} className="w-full border border-gray-300 rounded-md p-2 bg-gray-100" />
-              </div>
-              <div>
-                <label className="block text-sm font-medium text-gray-700">College Year</label>
-                <input
-                  type="text"
-                  value={profile.collegeYear}
-                  onChange={(e) => setProfile({ ...profile, collegeYear: e.target.value })}
-                  className="w-full border border-gray-300 rounded-md p-2"
-                />
-              </div>
-              <div>
-                <label className="block text-sm font-medium text-gray-700">Class</label>
-                <input
-                  type="text"
-                  value={profile.class}
-                  onChange={(e) => setProfile({ ...profile, class: e.target.value })}
-                  className="w-full border border-gray-300 rounded-md p-2"
-                />
-              </div>
-            </div>
-
-            <p className="text-xs text-gray-500 mt-3 break-words">
-              <span className="font-semibold">Nullifier Hash:</span> {profile.nullifierHash || "—"}
+          {account && typeof account === 'string' && (
+            <p className="text-sm text-gray-500">
+              Connected: {account.slice(0, 6)}...{account.slice(-4)}
             </p>
+          )}
 
-            <div className="mt-6 p-4 bg-blue-50 rounded-lg">
-              <h3 className="font-semibold text-blue-800 mb-2">Cast Vote on Blockchain</h3>
-              <label className="block text-sm font-medium text-gray-700 mb-1">Vote Option (e.g., 1=Yes)</label>
-              <input
-                type="number"
-                value={voteOption}
-                onChange={(e) => setVoteOption(Number(e.target.value))}
-                className="w-full border border-gray-300 rounded-md p-2 mb-3"
-                min="1"
-              />
-              <button
-                onClick={handleVote}
-                disabled={loading}
-                className="w-full bg-indigo-600 text-white rounded-md p-2 disabled:opacity-50"
-              >
-                {loading ? 'Submitting...' : 'Submit Vote'}
-              </button>
-              {voteTxHash && <p className="text-green-600 text-sm mt-2">✅ Vote Submitted! Tx: {voteTxHash}</p>}
-            </div>
-
-            <div className="mt-4 p-4 bg-yellow-50 rounded-lg">
-              <h3 className="font-semibold text-yellow-800 mb-2">Add Comment</h3>
-              <textarea
-                value={comment}
-                onChange={(e) => setComment(e.target.value)}
-                placeholder="Enter your comment..."
-                className="w-full border border-gray-300 rounded-md p-2 mb-3"
-                rows={3}
-              />
-              <button
-                onClick={handleComment}
-                disabled={loading || !comment.trim()}
-                className="w-full bg-yellow-600 text-white rounded-md p-2 disabled:opacity-50"
-              >
-                {loading ? 'Submitting...' : 'Submit Comment'}
-              </button>
-              {commentTxHash && <p className="text-green-600 text-sm mt-2">✅ Comment Added! Tx: {commentTxHash}</p>}
-            </div>
+          <div className="flex items-center gap-2">
+            <input
+              type="checkbox"
+              checked={useTestAadhaar}
+              onChange={(e) => setUseTestAadhaar(e.target.checked)}
+              id="testAadhaar"
+            />
+            <label htmlFor="testAadhaar" className="text-sm text-gray-700">
+              Use Test Aadhaar
+            </label>
           </div>
-        )}
 
-        {latestProof && (
-          <div className="mt-4 text-left w-full">
-            <p className="text-xs text-gray-500 mb-1">Raw Proof (debug):</p>
-            <div className="bg-gray-100 p-3 rounded-lg overflow-x-auto text-xs font-mono text-gray-800 max-h-48">
-              <AnonAadhaarProof code={JSON.stringify(latestProof, null, 2)} />
+          <LogInWithAnonAadhaar
+            fieldsToReveal={['revealGender', 'revealAgeAbove18', 'revealState', 'revealPinCode']}
+            nullifierSeed={Math.floor(Math.random() * 10000)}
+            _useTestAadhaar={useTestAadhaar}
+          />
+
+          {anonAadhaar.status === 'logged-in' && (
+            <div className="w-full bg-green-50 border border-green-200 rounded-xl p-4 mt-4">
+              <p className="text-green-700 font-semibold text-center">✅ Aadhaar Proof Valid</p>
+              <p className="text-sm text-gray-700 mt-1 text-center">Welcome, anonymous user!</p>
+
+              <div className="mt-4 space-y-3">
+                
+                <div>
+                  <label className="block text-sm font-medium text-gray-700">Pincode</label>
+                  <input
+                    type="text"
+                    disabled
+                    value={profile.pincode}
+                    className="w-full border border-gray-300 rounded-md p-2 bg-gray-100"
+                  />
+                </div>
+                <div>
+                  <label className="block text-sm font-medium text-gray-700">State</label>
+                  <input
+                    type="text"
+                    disabled
+                    value={profile.state}
+                    className="w-full border border-gray-300 rounded-md p-2 bg-gray-100"
+                  />
+                </div>
+                <div>
+                  <label className="block text-sm font-medium text-gray-700">Age</label>
+                  <input
+                    type="text"
+                    disabled
+                    value={profile.ageAbove18 ? '18+' : 'Under 18'}
+                    className="w-full border border-gray-300 rounded-md p-2 bg-gray-100"
+                  />
+                </div>
+               
+              </div>
+
+              <p className="text-xs text-gray-500 mt-3 break-words">
+                <span className="font-semibold">Nullifier Hash:</span> {anonAadhaar.anonAadhaarProofs['0'].nullifierHash || '—'}
+              </p>
+
+              <div className="mt-6 p-4 bg-blue-50 rounded-lg">
+                <h3 className="font-semibold text-blue-800 mb-2">Cast Vote on Blockchain</h3>
+                <label className="block text-sm font-medium text-gray-700 mb-1">
+                  Vote Option (e.g., 1=Yes)
+                </label>
+                <input
+                  type="number"
+                  value={voteOption}
+                  onChange={(e) => setVoteOption(Number(e.target.value))}
+                  className="w-full border border-gray-300 rounded-md p-2 mb-3"
+                  min="1"
+                />
+                <button
+                  onClick={handleVote}
+                  disabled={loading}
+                  className="w-full bg-indigo-600 text-white rounded-md p-2 disabled:opacity-50"
+                >
+                  {loading ? 'Submitting...' : 'Submit Vote'}
+                </button>
+                {voteTxHash && (
+                  <p className="text-green-600 text-sm mt-2">✅ Vote Submitted! Tx: {voteTxHash}</p>
+                )}
+              </div>
+
+              <div className="mt-4 p-4 bg-yellow-50 rounded-lg">
+                <h3 className="font-semibold text-yellow-800 mb-2">Add Comment</h3>
+                <textarea
+                  value={comment}
+                  onChange={(e) => setComment(e.target.value)}
+                  placeholder="Enter your comment..."
+                  className="w-full border border-gray-300 rounded-md p-2 mb-3"
+                  rows={3}
+                />
+                <button
+                  onClick={handleComment}
+                  disabled={loading || !comment.trim()}
+                  className="w-full bg-yellow-600 text-white rounded-md p-2 disabled:opacity-50"
+                >
+                  {loading ? 'Submitting...' : 'Submit Comment'}
+                </button>
+                {commentTxHash && (
+                  <p className="text-green-600 text-sm mt-2">✅ Comment Added! Tx: {commentTxHash}</p>
+                )}
+              </div>
+
+              {latestProof && (
+                <div className="mt-4 text-left w-full">
+                  <p className="text-xs text-gray-500 mb-1">Raw Proof (debug):</p>
+                  <div className="bg-gray-100 p-3 rounded-lg overflow-x-auto text-xs font-mono text-gray-800 max-h-48">
+                    <AnonAadhaarProof code={JSON.stringify(latestProof, null, 2)} />
+                  </div>
+                </div>
+              )}
             </div>
-          </div>
-        )}
-      </main>
-    </div>
+          )}
+        </main>
+      </div>
+    </ErrorBoundary>
   );
 }
 
